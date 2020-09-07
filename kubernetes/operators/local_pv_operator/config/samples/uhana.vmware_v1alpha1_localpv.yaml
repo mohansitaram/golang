@@ -1,0 +1,7 @@
+apiVersion: uhana.vmware.my.domain/v1alpha1
+kind: LocalPV
+metadata:
+  name: localpv-sample
+spec:
+  # Add fields here
+  foo: bar

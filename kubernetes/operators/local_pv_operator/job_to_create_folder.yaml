@@ -1,0 +1,24 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-pv-folder
+spec:
+  template:
+    spec:
+      containers:
+      - name: create-local-pv
+        image: busybox
+        volumeMounts:
+        - name: pv-folder
+          mountPath: /mnt/kubernetes/persistent_volumes/
+          readOnly: false
+        command: ["/bin/sh", "-c", "mkdir -p /mnt/kubernetes/persistent_volumes/test && chmod 777 /mnt/kubernetes/persistent_volumes/test"]
+      volumes:
+      - name: pv-folder
+        hostPath:
+          # Directory location on host
+          path: /mnt/kubernetes/persistent_volumes
+      restartPolicy: Never
+      nodeSelector:
+        temp: temp-pv-0
+  backoffLimit: 4

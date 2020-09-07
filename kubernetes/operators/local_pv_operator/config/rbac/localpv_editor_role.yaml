@@ -1,0 +1,24 @@
+# permissions for end users to edit localpvs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: localpv-editor-role
+rules:
+- apiGroups:
+  - uhana.vmware.my.domain
+  resources:
+  - localpvs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - uhana.vmware.my.domain
+  resources:
+  - localpvs/status
+  verbs:
+  - get

@@ -1,0 +1,8 @@
+apiVersion: uhana.vmware.my.domain/v1alpha1
+kind: LocalPV
+metadata:
+  name: local-pv-test
+spec:
+  instances: 1
+  name: local-pv-test
+  size: 3Gi
