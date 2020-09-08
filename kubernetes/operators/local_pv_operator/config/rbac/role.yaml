@@ -25,6 +25,16 @@ rules:
   verbs:
   - list
   - patch
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumes
+  verbs:
+  - create
+  - delete
+  - list
+  - watch
 - apiGroups:
   - uhana.vmware.my.domain
   resources:

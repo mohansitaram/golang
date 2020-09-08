@@ -49,7 +49,8 @@ type LocalPVReconciler struct {
 // +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=nodes,verbs=list;patch
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=list;patch;watch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=list;watch;create;delete
 
 func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("localpv", req.NamespacedName)
@@ -156,5 +157,6 @@ func (r *LocalPVReconciler) getDiff(pvIndices []string, numInstances int32) []st
 func (r *LocalPVReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&uhanavmwarev1alpha1.LocalPV{}).
+		Owns(&corev1.PersistentVolume{}).
 		Complete(r)
 }
