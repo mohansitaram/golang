@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -34,6 +35,8 @@ import (
 
 	uhanavmwarev1alpha1 "gitlab.eng.vmware.com/core-build/uhana_piran/api/v1alpha1"
 )
+
+const HostPvDir string = "/mnt/kubernetes/persistent_volumes/"
 
 type LabelReplace struct {
 	Op    string            `json:"op"`
@@ -74,6 +77,7 @@ func (r *LocalPVReconciler) getDiff(pvIndices []string, numInstances int32) []st
 // +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=list;patch;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=list;watch;create;delete
 
@@ -127,7 +131,6 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		remainingLabelIndices := r.getDiff(pvIndices, localpv.Spec.Instances)
 		for i, labelIndex := range remainingLabelIndices {
 			nodeToLabel := nodesWithoutLabel[i]
-			// TODO: Create the label and patch nodeToLabel
 			nodeLabels := nodeToLabel.Labels
 			label := labelValuePrefix + labelIndex
 			nodeLabels[localpv.Name] = label
@@ -144,14 +147,17 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			}
 		}
 	}
-	// TODO:
-	// On CRD creation:
-	//   1. Create PV
 	err = r.CreatePersistentVolumes(req, ctx, localpv)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	//   2. Create Job to create folder on labeled node. Then delete the job on successful creation
+	// TODO:
+	// On CRD creation:
+	//   1. Create Job to create folder on labeled node. Then delete the job on successful creation
+	err = r.CreateJobToCreateFolder(req, ctx, localpv)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	// On CRD deletion
 	//   1. Use PV as 'owned' object. Owned objects are auto garbaged collected on deletion
 	//   2. Labels and folders can't be 'owned' objects since they are not K8s native resources. Use finalizers for cleaning up labels and folders
@@ -159,7 +165,7 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 }
 
 func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx context.Context, localPV *uhanavmwarev1alpha1.LocalPV) error {
-	log := r.Log.WithValues("localpv", req.NamespacedName)
+	// log := r.Log.WithValues("localpv", req.NamespacedName)
 	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
 		pvIndex := strconv.Itoa(i)
 		pvNameWithIndex := localPV.Name + "-pv-" + pvIndex
@@ -177,7 +183,7 @@ func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx contex
 				StorageClassName:              localPV.Spec.StorageClass,
 				PersistentVolumeSource: corev1.PersistentVolumeSource{
 					Local: &corev1.LocalVolumeSource{
-						Path: "/mnt/kubernetes/persistent_volumes/" + strings.ReplaceAll(localPV.Name, "-", "_") + pvIndex,
+						Path: HostPvDir + strings.ReplaceAll(pvNameWithIndex, "-", "_"),
 					},
 				},
 				NodeAffinity: &corev1.VolumeNodeAffinity{
@@ -200,10 +206,65 @@ func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx contex
 		// Set LocalPV instance as the owner and controller
 		ctrl.SetControllerReference(localPV, pv, r.Scheme)
 		err := r.Create(ctx, pv)
-		if err != nil {
+		if err != nil && !errors.IsAlreadyExists(err) {
+			// TODO: Fix logging. logr logging is non trivial
 			// log.Error(err, "Failed to create PV", pvNameWithIndex)
 			return err
 		}
+	}
+	return nil
+}
+
+func (r *LocalPVReconciler) CreateJobToCreateFolder(req ctrl.Request, ctx context.Context, localPV *uhanavmwarev1alpha1.LocalPV) error {
+	// var jobs = []batchv1.Job{}
+	// log := r.Log.WithValues("localpv", req.NamespacedName)
+	var ttl int32 = 300
+	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
+		pvIndex := strconv.Itoa(i)
+		pvNameWithIndex := localPV.Name + "-pv-" + pvIndex
+		folderPath := HostPvDir + strings.ReplaceAll(pvNameWithIndex, "-", "_")
+		createFolderCommand := "mkdir -p " + folderPath + " && chmod 777 " + folderPath
+		volumeName := "pv-folder"
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "job-create-folder-" + pvNameWithIndex,
+				Namespace: localPV.Namespace,
+			},
+			Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Volumes: []corev1.Volume{corev1.Volume{
+							Name: volumeName,
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: HostPvDir,
+								},
+							},
+						}},
+						Containers: []corev1.Container{corev1.Container{
+							Name:    "create-local-pv",
+							Image:   "busybox",
+							Command: []string{"/bin/sh", "-c", createFolderCommand},
+							VolumeMounts: []corev1.VolumeMount{corev1.VolumeMount{
+								Name:      volumeName,
+								ReadOnly:  false,
+								MountPath: HostPvDir,
+							}},
+						}},
+						RestartPolicy: corev1.RestartPolicyOnFailure,
+						NodeSelector:  map[string]string{localPV.Name: pvNameWithIndex},
+					},
+				},
+				// Use the TTL Controller to cleanup these jobs
+				TTLSecondsAfterFinished: &ttl,
+			},
+		}
+		ctrl.SetControllerReference(localPV, job, r.Scheme)
+		err := r.Create(ctx, job)
+		if err != nil && !errors.IsAlreadyExists(err) {
+			return err
+		}
+		// jobs = append(jobs, job)
 	}
 	return nil
 }
