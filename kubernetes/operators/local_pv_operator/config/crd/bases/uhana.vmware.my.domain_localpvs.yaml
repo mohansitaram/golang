@@ -36,17 +36,23 @@ spec:
         spec:
           description: LocalPVSpec defines the desired state of LocalPV
           properties:
+            accessmode:
+              type: string
             instances:
               format: int32
               type: integer
-            name:
+            pvcreclaimpolicy:
               type: string
             size:
               type: string
+            storageclass:
+              type: string
           required:
+          - accessmode
           - instances
-          - name
+          - pvcreclaimpolicy
           - size
+          - storageclass
           type: object
         status:
           description: LocalPVStatus defines the observed state of LocalPV

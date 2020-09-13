@@ -28,9 +28,11 @@ import (
 type LocalPVSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 
-	Name      string `json:"name"`
-	Instances int32  `json:"instances"`
-	Size      string `json:"size"`
+	AccessMode       string `json:"accessmode"`
+	Instances        int32  `json:"instances"`
+	PVCReclaimPolicy string `json:"pvcreclaimpolicy"`
+	Size             string `json:"size"`
+	StorageClass     string `json:"storageclass"`
 }
 
 // LocalPVStatus defines the observed state of LocalPV

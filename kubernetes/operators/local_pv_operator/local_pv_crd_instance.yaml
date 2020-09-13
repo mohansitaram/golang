@@ -3,6 +3,9 @@ kind: LocalPV
 metadata:
   name: local-pv-test
 spec:
+  accessmode: ReadWriteOnce
   instances: 1
-  name: local-pv-test
+  pvcreclaimpolicy: Retain
   size: 3Gi
+  storageclass: local-pv-storage
+

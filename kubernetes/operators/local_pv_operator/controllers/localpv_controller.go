@@ -25,6 +25,8 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	types "k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -41,94 +43,9 @@ type LabelReplace struct {
 
 // LocalPVReconciler reconciles a LocalPV object
 type LocalPVReconciler struct {
-	Client client.Client
+	client.Client
 	Log    logr.Logger
 	Scheme *runtime.Scheme
-}
-
-// +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=nodes,verbs=list;patch;watch
-// +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=list;watch;create;delete
-
-func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	log := r.Log.WithValues("localpv", req.NamespacedName)
-	log.Info("Received request")
-	ctx := context.Background()
-
-	// Fetch the LocalPVInstance(s)
-	log.Info("Fetching localpv instance")
-	localpv := &uhanavmwarev1alpha1.LocalPV{}
-	err := r.Client.Get(ctx, req.NamespacedName, localpv)
-	log.Info("Sent API request to fetch instance. Checking result..")
-	if err != nil {
-		if errors.IsNotFound(err) {
-			// Request object not found, could have been deleted after reconcile request.
-			// Return and don't requeue
-			log.Info("LocalPV resource not found. Ignoring since object must be deleted")
-			return ctrl.Result{}, nil
-		}
-	}
-	// Check if the node labels are created, if not create them
-	nodeList := &corev1.NodeList{}
-	listOpts := []client.ListOption{}
-	log.Info("Listing nodes")
-	err = r.Client.List(ctx, nodeList, listOpts...)
-	if err != nil {
-		log.Info("Failed to list nodes. Generating error")
-		log.Error(err, "Failed to list nodes")
-		return ctrl.Result{}, err
-	}
-	log.Info("Nodes are ", nodeList.Items)
-	var pvIndices []string
-	var nodesWithoutLabel []corev1.Node
-	for _, node := range nodeList.Items {
-		log.Info("Checking labels on ", node.Name)
-		// Check localpv.Name on every node and create if not present
-		for label, value := range node.Labels {
-			if label == localpv.Name {
-				log.Info("Node ", node.Name, " already has label ", label)
-				pvIndices = append(pvIndices, strings.Split(value, "-")[2])
-			} else {
-				log.Info(node.Name, " doesn't have the label")
-				nodesWithoutLabel = append(nodesWithoutLabel, node)
-			}
-		}
-	}
-	log.Info("May or may not patch node here")
-	if int32(len(pvIndices)) < localpv.Spec.Instances {
-		// Randomize the node list. Ideally we should take into account
-		// the nodes' current free disk
-		r.RandomizeNodes(nodesWithoutLabel[:])
-		log.Info("Randomized nodes")
-		// Assign labels to nodes
-		labelValuePrefix := localpv.Name + "-" + "pv" + "-"
-		remainingLabelIndices := r.getDiff(pvIndices, localpv.Spec.Instances)
-		log.Info("Remaining label indices are ", remainingLabelIndices)
-		for i, labelIndex := range remainingLabelIndices {
-			nodeToLabel := nodesWithoutLabel[i]
-			// TODO: Create the label and patch nodeToLabel
-			nodeLabels := nodeToLabel.Labels
-			label := labelValuePrefix + labelIndex
-			nodeLabels[localpv.Name] = label
-			newLabels := make([]LabelReplace, 1)
-			newLabels[0].Op = "replace"
-			newLabels[0].Path = "/metadata/labels"
-			newLabels[0].Value = nodeLabels
-			patchBytes, _ := json.Marshal(newLabels)
-			log.Info("Patching node ", nodeToLabel.Name)
-			patch := client.RawPatch(types.JSONPatchType, patchBytes)
-			err = r.Client.Patch(ctx, &nodeToLabel, patch)
-			if err != nil {
-				log.Error(err, "Failed to patch node ", nodeToLabel.Name, " with label ", label)
-			} else {
-				log.Info("Successfully assigned label ", label, " to node ", nodeToLabel.Name)
-			}
-		}
-	}
-	log.Info("Ending Reconcile loop")
-	return ctrl.Result{}, nil
 }
 
 func (r *LocalPVReconciler) RandomizeNodes(nodes []corev1.Node) {
@@ -152,6 +69,143 @@ func (r *LocalPVReconciler) getDiff(pvIndices []string, numInstances int32) []st
 		}
 	}
 	return diff
+}
+
+// +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=list;patch;watch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=list;watch;create;delete
+
+func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
+	log := r.Log.WithValues("localpv", req.NamespacedName)
+	log.Info("Received request")
+	ctx := context.Background()
+
+	// Fetch the LocalPVInstance(s)
+	log.Info("Fetching localpv instance")
+	localpv := &uhanavmwarev1alpha1.LocalPV{}
+	err := r.Get(ctx, req.NamespacedName, localpv)
+	log.Info("Sent API request to fetch instance. Checking result..")
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// Request object not found, could have been deleted after reconcile request.
+			// Return and don't requeue
+			log.Info("LocalPV resource not found. Ignoring since object must be deleted")
+			return ctrl.Result{}, nil
+		}
+	}
+	// Check if the node labels are created, if not create them
+	nodeList := &corev1.NodeList{}
+	listOpts := []client.ListOption{}
+	err = r.List(ctx, nodeList, listOpts...)
+	if err != nil {
+		log.Info("Failed to list nodes. Generating error")
+		log.Error(err, "Failed to list nodes")
+		return ctrl.Result{}, err
+	}
+	var pvIndices []string
+	var nodesWithoutLabel []corev1.Node
+	for _, node := range nodeList.Items {
+		// Check localpv.Name on every node and create if not present
+		for label, value := range node.Labels {
+			if label == localpv.Name {
+				// log.Info("Node ", node.Name, " already has label ", label)
+				pvIndices = append(pvIndices, strings.Split(value, "-")[2])
+			} else {
+				//log.Info(node.Name, " doesn't have the label")
+				nodesWithoutLabel = append(nodesWithoutLabel, node)
+			}
+		}
+	}
+	if int32(len(pvIndices)) < localpv.Spec.Instances {
+		// Randomize the node list. Ideally we should take into account
+		// the nodes' current free disk
+		r.RandomizeNodes(nodesWithoutLabel[:])
+		// Assign labels to nodes
+		labelValuePrefix := localpv.Name + "-" + "pv" + "-"
+		remainingLabelIndices := r.getDiff(pvIndices, localpv.Spec.Instances)
+		for i, labelIndex := range remainingLabelIndices {
+			nodeToLabel := nodesWithoutLabel[i]
+			// TODO: Create the label and patch nodeToLabel
+			nodeLabels := nodeToLabel.Labels
+			label := labelValuePrefix + labelIndex
+			nodeLabels[localpv.Name] = label
+			newLabels := make([]LabelReplace, 1)
+			newLabels[0].Op = "replace"
+			newLabels[0].Path = "/metadata/labels"
+			newLabels[0].Value = nodeLabels
+			patchBytes, _ := json.Marshal(newLabels)
+			patch := client.RawPatch(types.JSONPatchType, patchBytes)
+			err = r.Patch(ctx, &nodeToLabel, patch)
+			if err != nil {
+				log.Error(err, "Failed to patch node", nodeToLabel.Name, "with label", label)
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	// TODO:
+	// On CRD creation:
+	//   1. Create PV
+	err = r.CreatePersistentVolumes(req, ctx, localpv)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	//   2. Create Job to create folder on labeled node. Then delete the job on successful creation
+	// On CRD deletion
+	//   1. Use PV as 'owned' object. Owned objects are auto garbaged collected on deletion
+	//   2. Labels and folders can't be 'owned' objects since they are not K8s native resources. Use finalizers for cleaning up labels and folders
+	return ctrl.Result{}, nil
+}
+
+func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx context.Context, localPV *uhanavmwarev1alpha1.LocalPV) error {
+	log := r.Log.WithValues("localpv", req.NamespacedName)
+	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
+		pvIndex := strconv.Itoa(i)
+		pvNameWithIndex := localPV.Name + "-pv-" + pvIndex
+		pv := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: pvNameWithIndex,
+			},
+			Spec: corev1.PersistentVolumeSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{
+					corev1.PersistentVolumeAccessMode(localPV.Spec.AccessMode)},
+				Capacity: corev1.ResourceList{
+					"storage": resource.MustParse(localPV.Spec.Size),
+				},
+				PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimPolicy(localPV.Spec.PVCReclaimPolicy),
+				StorageClassName:              localPV.Spec.StorageClass,
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					Local: &corev1.LocalVolumeSource{
+						Path: "/mnt/kubernetes/persistent_volumes/" + strings.ReplaceAll(localPV.Name, "-", "_") + pvIndex,
+					},
+				},
+				NodeAffinity: &corev1.VolumeNodeAffinity{
+					Required: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							corev1.NodeSelectorTerm{
+								MatchExpressions: []corev1.NodeSelectorRequirement{
+									corev1.NodeSelectorRequirement{
+										Key:      localPV.Name,
+										Operator: "In",
+										Values:   []string{pvNameWithIndex},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		// Set LocalPV instance as the owner and controller
+		ctrl.SetControllerReference(localPV, pv, r.Scheme)
+		err := r.Create(ctx, pv)
+		if err != nil {
+			// log.Error(err, "Failed to create PV", pvNameWithIndex)
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *LocalPVReconciler) SetupWithManager(mgr ctrl.Manager) error {
