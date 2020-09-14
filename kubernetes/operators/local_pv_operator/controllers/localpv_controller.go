@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -25,7 +26,7 @@ import (
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -83,14 +84,11 @@ func (r *LocalPVReconciler) getDiff(pvIndices []string, numInstances int32) []st
 
 func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("localpv", req.NamespacedName)
-	log.Info("Received request")
 	ctx := context.Background()
 
 	// Fetch the LocalPVInstance(s)
-	log.Info("Fetching localpv instance")
 	localpv := &uhanavmwarev1alpha1.LocalPV{}
 	err := r.Get(ctx, req.NamespacedName, localpv)
-	log.Info("Sent API request to fetch instance. Checking result..")
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -104,8 +102,11 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	listOpts := []client.ListOption{}
 	err = r.List(ctx, nodeList, listOpts...)
 	if err != nil {
-		log.Info("Failed to list nodes. Generating error")
-		log.Error(err, "Failed to list nodes")
+		return ctrl.Result{}, err
+	}
+	if int32(len(nodeList.Items)) < localpv.Spec.Instances {
+		errMsg := fmt.Sprintf("Number of nodes %d is smaller than the required number of instances %d for %s", len(nodeList.Items), localpv.Spec.Instances, localpv.Name)
+		err = errors.NewBadRequest(errMsg)
 		return ctrl.Result{}, err
 	}
 	var pvIndices []string
@@ -223,7 +224,7 @@ func (r *LocalPVReconciler) CreateJobToCreateFolder(req ctrl.Request, ctx contex
 		pvIndex := strconv.Itoa(i)
 		pvNameWithIndex := localPV.Name + "-pv-" + pvIndex
 		folderPath := HostPvDir + strings.ReplaceAll(pvNameWithIndex, "-", "_")
-		createFolderCommand := "mkdir -p " + folderPath + " && chmod 777 " + folderPath
+		createFolderCommand := "mkdir -p " + folderPath + " && chmod 744 " + folderPath
 		volumeName := "pv-folder"
 		job := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
@@ -255,7 +256,7 @@ func (r *LocalPVReconciler) CreateJobToCreateFolder(req ctrl.Request, ctx contex
 						NodeSelector:  map[string]string{localPV.Name: pvNameWithIndex},
 					},
 				},
-				// Use the TTL Controller to cleanup these jobs
+				// Use the TTL Controller to automatically clean up these jobs
 				TTLSecondsAfterFinished: &ttl,
 			},
 		}
@@ -264,6 +265,7 @@ func (r *LocalPVReconciler) CreateJobToCreateFolder(req ctrl.Request, ctx contex
 		if err != nil && !errors.IsAlreadyExists(err) {
 			return err
 		}
+                // TODO: Check job completion status
 		// jobs = append(jobs, job)
 	}
 	return nil
