@@ -152,9 +152,6 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// TODO:
-	// On CRD creation:
-	//   1. Create Job to create folder on labeled node. Then delete the job on successful creation
 	err = r.CreateJobToCreateFolder(req, ctx, localpv)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -217,7 +214,7 @@ func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx contex
 }
 
 func (r *LocalPVReconciler) CreateJobToCreateFolder(req ctrl.Request, ctx context.Context, localPV *uhanavmwarev1alpha1.LocalPV) error {
-	// var jobs = []batchv1.Job{}
+	var jobs = []batchv1.Job{}
 	// log := r.Log.WithValues("localpv", req.NamespacedName)
 	var ttl int32 = 300
 	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
@@ -265,10 +262,60 @@ func (r *LocalPVReconciler) CreateJobToCreateFolder(req ctrl.Request, ctx contex
 		if err != nil && !errors.IsAlreadyExists(err) {
 			return err
 		}
-                // TODO: Check job completion status
-		// jobs = append(jobs, job)
+		// TODO: Check job completion status
+		jobs = append(jobs, *job)
+	}
+	err := r.CheckJobsStatus(req, ctx, jobs)
+	if err != nil {
+		return err
 	}
 	return nil
+}
+
+func (r *LocalPVReconciler) CheckJobsStatus(req ctrl.Request, ctx context.Context, jobs []batchv1.Job) error {
+	log := r.Log.WithValues("localpv", req.NamespacedName)
+	timeout := time.After(120 * time.Second)
+	ticker := time.Tick(1 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			return errors.NewTimeoutError("Timed out waiting for folder creation Jobs to complete. Next reconcile loop might succeed", 2)
+		case <-ticker:
+			if len(jobs) == 0 {
+				log.Info("All jobs completed successfully")
+				return nil
+			}
+			completedJobs := []batchv1.Job{}
+			for _, job := range jobs {
+				foundJob := &batchv1.Job{}
+				err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, foundJob)
+				if err != nil {
+					if errors.IsNotFound(err) {
+						log.Info("Job Not found. Maybe it completed successfully and got deleted. Ignoring..")
+						completedJobs = append(completedJobs, job)
+						continue
+					}
+					return err
+				}
+				if foundJob.Status.Succeeded > 0 {
+					completedJobs = append(completedJobs, job)
+				}
+			}
+			for _, job := range completedJobs {
+				jobs = DeleteJobFromJoblist(job, jobs)
+			}
+		}
+	}
+}
+
+func DeleteJobFromJoblist(jobToDelete batchv1.Job, jobs []batchv1.Job) []batchv1.Job {
+	newJobList := []batchv1.Job{}
+	for _, job := range jobs {
+		if job.Name != jobToDelete.Name {
+			newJobList = append(newJobList, job)
+		}
+	}
+	return newJobList
 }
 
 func (r *LocalPVReconciler) SetupWithManager(mgr ctrl.Manager) error {
