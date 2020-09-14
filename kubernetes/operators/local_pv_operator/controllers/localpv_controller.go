@@ -17,14 +17,16 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,6 +36,8 @@ import (
 
 	uhanavmwarev1alpha1 "gitlab.eng.vmware.com/core-build/uhana_piran/api/v1alpha1"
 )
+
+const HostPvDir string = "/mnt/kubernetes/persistent_volumes/"
 
 type LabelReplace struct {
 	Op    string            `json:"op"`
@@ -74,19 +78,17 @@ func (r *LocalPVReconciler) getDiff(pvIndices []string, numInstances int32) []st
 // +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=list;patch;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=list;watch;create;delete
 
 func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("localpv", req.NamespacedName)
-	log.Info("Received request")
 	ctx := context.Background()
 
 	// Fetch the LocalPVInstance(s)
-	log.Info("Fetching localpv instance")
 	localpv := &uhanavmwarev1alpha1.LocalPV{}
 	err := r.Get(ctx, req.NamespacedName, localpv)
-	log.Info("Sent API request to fetch instance. Checking result..")
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -100,8 +102,11 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	listOpts := []client.ListOption{}
 	err = r.List(ctx, nodeList, listOpts...)
 	if err != nil {
-		log.Info("Failed to list nodes. Generating error")
-		log.Error(err, "Failed to list nodes")
+		return ctrl.Result{}, err
+	}
+	if int32(len(nodeList.Items)) < localpv.Spec.Instances {
+		errMsg := fmt.Sprintf("Number of nodes %d is smaller than the required number of instances %d for %s", len(nodeList.Items), localpv.Spec.Instances, localpv.Name)
+		err = errors.NewBadRequest(errMsg)
 		return ctrl.Result{}, err
 	}
 	var pvIndices []string
@@ -127,7 +132,6 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		remainingLabelIndices := r.getDiff(pvIndices, localpv.Spec.Instances)
 		for i, labelIndex := range remainingLabelIndices {
 			nodeToLabel := nodesWithoutLabel[i]
-			// TODO: Create the label and patch nodeToLabel
 			nodeLabels := nodeToLabel.Labels
 			label := labelValuePrefix + labelIndex
 			nodeLabels[localpv.Name] = label
@@ -144,14 +148,14 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			}
 		}
 	}
-	// TODO:
-	// On CRD creation:
-	//   1. Create PV
 	err = r.CreatePersistentVolumes(req, ctx, localpv)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	//   2. Create Job to create folder on labeled node. Then delete the job on successful creation
+	err = r.CreateJobToCreateFolder(req, ctx, localpv)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	// On CRD deletion
 	//   1. Use PV as 'owned' object. Owned objects are auto garbaged collected on deletion
 	//   2. Labels and folders can't be 'owned' objects since they are not K8s native resources. Use finalizers for cleaning up labels and folders
@@ -159,7 +163,7 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 }
 
 func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx context.Context, localPV *uhanavmwarev1alpha1.LocalPV) error {
-	log := r.Log.WithValues("localpv", req.NamespacedName)
+	// log := r.Log.WithValues("localpv", req.NamespacedName)
 	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
 		pvIndex := strconv.Itoa(i)
 		pvNameWithIndex := localPV.Name + "-pv-" + pvIndex
@@ -177,7 +181,7 @@ func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx contex
 				StorageClassName:              localPV.Spec.StorageClass,
 				PersistentVolumeSource: corev1.PersistentVolumeSource{
 					Local: &corev1.LocalVolumeSource{
-						Path: "/mnt/kubernetes/persistent_volumes/" + strings.ReplaceAll(localPV.Name, "-", "_") + pvIndex,
+						Path: HostPvDir + strings.ReplaceAll(pvNameWithIndex, "-", "_"),
 					},
 				},
 				NodeAffinity: &corev1.VolumeNodeAffinity{
@@ -200,12 +204,118 @@ func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx contex
 		// Set LocalPV instance as the owner and controller
 		ctrl.SetControllerReference(localPV, pv, r.Scheme)
 		err := r.Create(ctx, pv)
-		if err != nil {
+		if err != nil && !errors.IsAlreadyExists(err) {
+			// TODO: Fix logging. logr logging is non trivial
 			// log.Error(err, "Failed to create PV", pvNameWithIndex)
 			return err
 		}
 	}
 	return nil
+}
+
+func (r *LocalPVReconciler) CreateJobToCreateFolder(req ctrl.Request, ctx context.Context, localPV *uhanavmwarev1alpha1.LocalPV) error {
+	var jobs = []batchv1.Job{}
+	// log := r.Log.WithValues("localpv", req.NamespacedName)
+	var ttl int32 = 300
+	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
+		pvIndex := strconv.Itoa(i)
+		pvNameWithIndex := localPV.Name + "-pv-" + pvIndex
+		folderPath := HostPvDir + strings.ReplaceAll(pvNameWithIndex, "-", "_")
+		createFolderCommand := "mkdir -p " + folderPath + " && chmod 744 " + folderPath
+		volumeName := "pv-folder"
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "job-create-folder-" + pvNameWithIndex,
+				Namespace: localPV.Namespace,
+			},
+			Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Volumes: []corev1.Volume{corev1.Volume{
+							Name: volumeName,
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: HostPvDir,
+								},
+							},
+						}},
+						Containers: []corev1.Container{corev1.Container{
+							Name:    "create-local-pv",
+							Image:   "busybox",
+							Command: []string{"/bin/sh", "-c", createFolderCommand},
+							VolumeMounts: []corev1.VolumeMount{corev1.VolumeMount{
+								Name:      volumeName,
+								ReadOnly:  false,
+								MountPath: HostPvDir,
+							}},
+						}},
+						RestartPolicy: corev1.RestartPolicyOnFailure,
+						NodeSelector:  map[string]string{localPV.Name: pvNameWithIndex},
+					},
+				},
+				// Use the TTL Controller to automatically clean up these jobs
+				TTLSecondsAfterFinished: &ttl,
+			},
+		}
+		ctrl.SetControllerReference(localPV, job, r.Scheme)
+		err := r.Create(ctx, job)
+		if err != nil && !errors.IsAlreadyExists(err) {
+			return err
+		}
+		// TODO: Check job completion status
+		jobs = append(jobs, *job)
+	}
+	err := r.CheckJobsStatus(req, ctx, jobs)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *LocalPVReconciler) CheckJobsStatus(req ctrl.Request, ctx context.Context, jobs []batchv1.Job) error {
+	log := r.Log.WithValues("localpv", req.NamespacedName)
+	timeout := time.After(120 * time.Second)
+	ticker := time.Tick(1 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			return errors.NewTimeoutError("Timed out waiting for folder creation Jobs to complete. Next reconcile loop might succeed", 2)
+		case <-ticker:
+			if len(jobs) == 0 {
+				log.Info("All jobs completed successfully")
+				return nil
+			}
+			completedJobs := []batchv1.Job{}
+			for _, job := range jobs {
+				foundJob := &batchv1.Job{}
+				err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, foundJob)
+				if err != nil {
+					if errors.IsNotFound(err) {
+						log.Info("Job Not found. Maybe it completed successfully and got deleted. Ignoring..")
+						completedJobs = append(completedJobs, job)
+						continue
+					}
+					return err
+				}
+				if foundJob.Status.Succeeded > 0 {
+					completedJobs = append(completedJobs, job)
+				}
+			}
+			for _, job := range completedJobs {
+				jobs = DeleteJobFromJoblist(job, jobs)
+			}
+		}
+	}
+}
+
+func DeleteJobFromJoblist(jobToDelete batchv1.Job, jobs []batchv1.Job) []batchv1.Job {
+	newJobList := []batchv1.Job{}
+	for _, job := range jobs {
+		if job.Name != jobToDelete.Name {
+			newJobList = append(newJobList, job)
+		}
+	}
+	return newJobList
 }
 
 func (r *LocalPVReconciler) SetupWithManager(mgr ctrl.Manager) error {
