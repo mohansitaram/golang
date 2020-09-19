@@ -33,11 +33,13 @@ import (
 	types "k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	uhanavmwarev1alpha1 "gitlab.eng.vmware.com/core-build/uhana_piran/api/v1alpha1"
 )
 
 const HostPvDir string = "/mnt/kubernetes/persistent_volumes/"
+const localPvFinalizer string = "finalizer.localpv.uhana.vmware.com"
 
 type LabelReplace struct {
 	Op    string            `json:"op"`
@@ -97,10 +99,26 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			return ctrl.Result{}, nil
 		}
 	}
+	// Check if the instance was deleted
+	if localpv.GetDeletionTimestamp() != nil {
+		return r.DeleteLocalPVHandler(localpv, log)
+	}
+	if !controllerutil.ContainsFinalizer(localpv, localPvFinalizer) {
+		// This usually means the localPV just got created and it doesn't have the finalizer added. Add it now
+		err = r.updateFinalizer(controllerutil.AddFinalizer, localpv)
+		if err != nil {
+			log.Error(err, "Failed to add finalizer to LocalPV instnace")
+			return ctrl.Result{}, err
+		}
+	}
+	return r.CreateLocalPVhandler(localpv, log)
+}
+
+func (r *LocalPVReconciler) CreateLocalPVhandler(localpv *uhanavmwarev1alpha1.LocalPV, log logr.Logger) (ctrl.Result, error) {
 	// Check if the node labels are created, if not create them
 	nodeList := &corev1.NodeList{}
 	listOpts := []client.ListOption{}
-	err = r.List(ctx, nodeList, listOpts...)
+	err := r.List(context.TODO(), nodeList, listOpts...)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -141,35 +159,56 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			newLabels[0].Value = nodeLabels
 			patchBytes, _ := json.Marshal(newLabels)
 			patch := client.RawPatch(types.JSONPatchType, patchBytes)
-			err = r.Patch(ctx, &nodeToLabel, patch)
+			err = r.Patch(context.TODO(), &nodeToLabel, patch)
 			if err != nil {
 				log.Error(err, "Failed to patch node", nodeToLabel.Name, "with label", label)
 				return ctrl.Result{}, err
 			}
 		}
 	}
-	err = r.CreatePersistentVolumes(req, ctx, localpv)
+	err = r.CreatePersistentVolumes(localpv, log)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	err = r.CreateJobToCreateFolder(req, ctx, localpv)
+	err = r.CreateJobToCreateFolder(localpv, log)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// On CRD deletion
-	//   1. Use PV as 'owned' object. Owned objects are auto garbaged collected on deletion
-	//   2. Labels and folders can't be 'owned' objects since they are not K8s native resources. Use finalizers for cleaning up labels and folders
 	return ctrl.Result{}, nil
 }
 
-func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx context.Context, localPV *uhanavmwarev1alpha1.LocalPV) error {
-	// log := r.Log.WithValues("localpv", req.NamespacedName)
+func (r *LocalPVReconciler) DeleteLocalPVHandler(localpv *uhanavmwarev1alpha1.LocalPV, log logr.Logger) (ctrl.Result, error) {
+	log.Info("Cleaning up after LocalPV instance deletion")
+	err := r.finalizeLocalPV(localpv, log)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Finally, remove finalizer. This is required so that the CR can finally be deleted from the API server
+	err = r.updateFinalizer(controllerutil.RemoveFinalizer, localpv)
+	if err != nil {
+		log.Error(err, "Failed to remove finalizer from LocalPV instance")
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *LocalPVReconciler) finalizeLocalPV(localPV *uhanavmwarev1alpha1.LocalPV, log logr.Logger) error {
+	// TODO
+	// 1. Delete PV
+	// 2. Delete PVC
+	// 3. Delete folders via Jobs. Check their completion status
+	// 4. Delete labels on nodes
+	return nil
+}
+
+func (r *LocalPVReconciler) CreatePersistentVolumes(localPV *uhanavmwarev1alpha1.LocalPV, log logr.Logger) error {
 	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
 		pvIndex := strconv.Itoa(i)
 		pvNameWithIndex := localPV.Name + "-pv-" + pvIndex
 		pv := &corev1.PersistentVolume{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: pvNameWithIndex,
+				Name:   pvNameWithIndex,
+				Labels: map[string]string{"localpv": localPV.Name},
 			},
 			Spec: corev1.PersistentVolumeSpec{
 				AccessModes: []corev1.PersistentVolumeAccessMode{
@@ -201,9 +240,9 @@ func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx contex
 				},
 			},
 		}
-		// Set LocalPV instance as the owner and controller
-		ctrl.SetControllerReference(localPV, pv, r.Scheme)
-		err := r.Create(ctx, pv)
+		// Set LocalPV instance as the owner
+		controllerutil.SetOwnerReference(localPV, pv, r.Scheme)
+		err := r.Create(context.TODO(), pv)
 		if err != nil && !errors.IsAlreadyExists(err) {
 			// TODO: Fix logging. logr logging is non trivial
 			// log.Error(err, "Failed to create PV", pvNameWithIndex)
@@ -213,9 +252,8 @@ func (r *LocalPVReconciler) CreatePersistentVolumes(req ctrl.Request, ctx contex
 	return nil
 }
 
-func (r *LocalPVReconciler) CreateJobToCreateFolder(req ctrl.Request, ctx context.Context, localPV *uhanavmwarev1alpha1.LocalPV) error {
+func (r *LocalPVReconciler) CreateJobToCreateFolder(localPV *uhanavmwarev1alpha1.LocalPV, log logr.Logger) error {
 	var jobs = []batchv1.Job{}
-	// log := r.Log.WithValues("localpv", req.NamespacedName)
 	var ttl int32 = 300
 	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
 		pvIndex := strconv.Itoa(i)
@@ -257,23 +295,21 @@ func (r *LocalPVReconciler) CreateJobToCreateFolder(req ctrl.Request, ctx contex
 				TTLSecondsAfterFinished: &ttl,
 			},
 		}
-		ctrl.SetControllerReference(localPV, job, r.Scheme)
-		err := r.Create(ctx, job)
+		controllerutil.SetOwnerReference(localPV, job, r.Scheme)
+		err := r.Create(context.TODO(), job)
 		if err != nil && !errors.IsAlreadyExists(err) {
 			return err
 		}
-		// TODO: Check job completion status
 		jobs = append(jobs, *job)
 	}
-	err := r.CheckJobsStatus(req, ctx, jobs)
+	err := r.CheckJobsStatus(jobs, log)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (r *LocalPVReconciler) CheckJobsStatus(req ctrl.Request, ctx context.Context, jobs []batchv1.Job) error {
-	log := r.Log.WithValues("localpv", req.NamespacedName)
+func (r *LocalPVReconciler) CheckJobsStatus(jobs []batchv1.Job, log logr.Logger) error {
 	timeout := time.After(120 * time.Second)
 	ticker := time.Tick(1 * time.Second)
 	for {
@@ -288,7 +324,7 @@ func (r *LocalPVReconciler) CheckJobsStatus(req ctrl.Request, ctx context.Contex
 			completedJobs := []batchv1.Job{}
 			for _, job := range jobs {
 				foundJob := &batchv1.Job{}
-				err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, foundJob)
+				err := r.Get(context.TODO(), types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, foundJob)
 				if err != nil {
 					if errors.IsNotFound(err) {
 						log.Info("Job Not found. Maybe it completed successfully and got deleted. Ignoring..")
@@ -316,6 +352,16 @@ func DeleteJobFromJoblist(jobToDelete batchv1.Job, jobs []batchv1.Job) []batchv1
 		}
 	}
 	return newJobList
+}
+
+func (r *LocalPVReconciler) updateFinalizer(f func(localPV controllerutil.Object, finalizerName string), localPV *uhanavmwarev1alpha1.LocalPV) error {
+	f(localPV, localPvFinalizer)
+	// Update the custom resource
+	err := r.Update(context.TODO(), localPV)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *LocalPVReconciler) SetupWithManager(mgr ctrl.Manager) error {
