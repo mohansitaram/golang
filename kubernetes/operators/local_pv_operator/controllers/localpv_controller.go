@@ -54,35 +54,13 @@ type LocalPVReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-func (r *LocalPVReconciler) RandomizeNodes(nodes []corev1.Node) {
-	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(nodes), func(i, j int) {
-		nodes[i], nodes[j] = nodes[j], nodes[i]
-	})
-}
-
-func (r *LocalPVReconciler) getDiff(pvIndices []string, numInstances int32) []string {
-	tempMap := make(map[int]string)
-	for _, pvIndex := range pvIndices {
-		i, _ := strconv.Atoi(pvIndex)
-		tempMap[i] = pvIndex
-	}
-	var diff []string
-	for i := 0; i < int(numInstances); i++ {
-		_, ok := tempMap[i]
-		if !ok {
-			diff = append(diff, strconv.Itoa(i))
-		}
-	}
-	return diff
-}
-
 // +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=uhana.vmware.my.domain,resources=localpvs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=list;patch;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=list;watch;create;delete
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=list;watch;create;delete
 
 func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("localpv", req.NamespacedName)
@@ -101,7 +79,8 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 	// Check if the instance was deleted
 	if localpv.GetDeletionTimestamp() != nil {
-		return r.DeleteLocalPVHandler(localpv, log)
+		// If yes, handle deletion logic including running finalizer
+		return r.deleteLocalPVHandler(localpv, log)
 	}
 	if !controllerutil.ContainsFinalizer(localpv, localPvFinalizer) {
 		// This usually means the localPV just got created and it doesn't have the finalizer added. Add it now
@@ -111,14 +90,13 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			return ctrl.Result{}, err
 		}
 	}
-	return r.CreateLocalPVhandler(localpv, log)
+	return r.createLocalPVhandler(localpv, log)
 }
 
-func (r *LocalPVReconciler) CreateLocalPVhandler(localpv *uhanavmwarev1alpha1.LocalPV, log logr.Logger) (ctrl.Result, error) {
+func (r *LocalPVReconciler) createLocalPVhandler(localpv *uhanavmwarev1alpha1.LocalPV, log logr.Logger) (ctrl.Result, error) {
 	// Check if the node labels are created, if not create them
-	nodeList := &corev1.NodeList{}
 	listOpts := []client.ListOption{}
-	err := r.List(context.TODO(), nodeList, listOpts...)
+	nodeList, err := r.listNodes(log, listOpts)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -144,40 +122,33 @@ func (r *LocalPVReconciler) CreateLocalPVhandler(localpv *uhanavmwarev1alpha1.Lo
 	if int32(len(pvIndices)) < localpv.Spec.Instances {
 		// Randomize the node list. Ideally we should take into account
 		// the nodes' current free disk
-		r.RandomizeNodes(nodesWithoutLabel[:])
+		r.randomizeNodes(nodesWithoutLabel[:])
 		// Assign labels to nodes
 		labelValuePrefix := localpv.Name + "-" + "pv" + "-"
 		remainingLabelIndices := r.getDiff(pvIndices, localpv.Spec.Instances)
 		for i, labelIndex := range remainingLabelIndices {
 			nodeToLabel := nodesWithoutLabel[i]
-			nodeLabels := nodeToLabel.Labels
+			// newLabels := nodeToLabel.Labels
 			label := labelValuePrefix + labelIndex
-			nodeLabels[localpv.Name] = label
-			newLabels := make([]LabelReplace, 1)
-			newLabels[0].Op = "replace"
-			newLabels[0].Path = "/metadata/labels"
-			newLabels[0].Value = nodeLabels
-			patchBytes, _ := json.Marshal(newLabels)
-			patch := client.RawPatch(types.JSONPatchType, patchBytes)
-			err = r.Patch(context.TODO(), &nodeToLabel, patch)
+			nodeToLabel.Labels[localpv.Name] = label
+			err = r.patchNodeLabels(&nodeToLabel, nodeToLabel.Labels, log)
 			if err != nil {
-				log.Error(err, "Failed to patch node", nodeToLabel.Name, "with label", label)
 				return ctrl.Result{}, err
 			}
 		}
 	}
-	err = r.CreatePersistentVolumes(localpv, log)
+	err = r.createPersistentVolumes(localpv, log)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	err = r.CreateJobToCreateFolder(localpv, log)
+	err = r.launchFolderJobs(localpv, log, "create")
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
 }
 
-func (r *LocalPVReconciler) DeleteLocalPVHandler(localpv *uhanavmwarev1alpha1.LocalPV, log logr.Logger) (ctrl.Result, error) {
+func (r *LocalPVReconciler) deleteLocalPVHandler(localpv *uhanavmwarev1alpha1.LocalPV, log logr.Logger) (ctrl.Result, error) {
 	log.Info("Cleaning up after LocalPV instance deletion")
 	err := r.finalizeLocalPV(localpv, log)
 	if err != nil {
@@ -193,15 +164,70 @@ func (r *LocalPVReconciler) DeleteLocalPVHandler(localpv *uhanavmwarev1alpha1.Lo
 }
 
 func (r *LocalPVReconciler) finalizeLocalPV(localPV *uhanavmwarev1alpha1.LocalPV, log logr.Logger) error {
-	// TODO
-	// 1. Delete PV
-	// 2. Delete PVC
-	// 3. Delete folders via Jobs. Check their completion status
+	// 1. Delete PVs and their corresponding PVCs
+	var pvList = &corev1.PersistentVolumeList{}
+	listOpts := []client.ListOption{
+		client.MatchingLabels{"localpv": localPV.Name},
+	}
+	ctx := context.TODO()
+	err := r.List(ctx, pvList, listOpts...)
+	pvc := &corev1.PersistentVolumeClaim{}
+	for _, pv := range pvList.Items {
+		pvClaimRef := pv.Spec.ClaimRef
+		if pvClaimRef == nil {
+			log.Info("This PV doesn't have a PVC. Not deleting")
+			continue
+		}
+		err = r.Get(ctx, types.NamespacedName{Name: pvClaimRef.Name, Namespace: pvClaimRef.Namespace}, pvc)
+		if err != nil {
+			log.Error(err, "Failed to get PVC")
+		}
+		log.Info("Deleting PVC")
+		err = r.Delete(ctx, pvc)
+		if err != nil {
+			log.Error(err, "Failed to delete PVC.")
+			return err
+		}
+		log.Info("Deleting PV")
+		err = r.Delete(ctx, &pv)
+		if err != nil {
+			log.Error(err, "Failed to delete PV.")
+			return err
+		}
+	}
+	// 2. Delete folders via Jobs. Check their completion status
+	log.Info("Deleting folders")
+	err = r.launchFolderJobs(localPV, log, "delete")
+	if err != nil {
+		return err
+	}
 	// 4. Delete labels on nodes
+	err = r.deleteNodeLabels(localPV, log)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
-func (r *LocalPVReconciler) CreatePersistentVolumes(localPV *uhanavmwarev1alpha1.LocalPV, log logr.Logger) error {
+func (r *LocalPVReconciler) deleteNodeLabels(localpv *uhanavmwarev1alpha1.LocalPV, log logr.Logger) error {
+	listOpts := []client.ListOption{}
+	nodeList, err := r.listNodes(log, listOpts)
+	if err != nil {
+		return err
+	}
+	for _, node := range nodeList.Items {
+		if _, ok := node.Labels[localpv.Name]; ok {
+			delete(node.Labels, localpv.Name)
+			err = r.patchNodeLabels(&node, node.Labels, log)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *LocalPVReconciler) createPersistentVolumes(localPV *uhanavmwarev1alpha1.LocalPV, log logr.Logger) error {
 	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
 		pvIndex := strconv.Itoa(i)
 		pvNameWithIndex := localPV.Name + "-pv-" + pvIndex
@@ -252,18 +278,23 @@ func (r *LocalPVReconciler) CreatePersistentVolumes(localPV *uhanavmwarev1alpha1
 	return nil
 }
 
-func (r *LocalPVReconciler) CreateJobToCreateFolder(localPV *uhanavmwarev1alpha1.LocalPV, log logr.Logger) error {
+func (r *LocalPVReconciler) launchFolderJobs(localPV *uhanavmwarev1alpha1.LocalPV, log logr.Logger, task string) error {
 	var jobs = []batchv1.Job{}
 	var ttl int32 = 300
 	for i := 0; int32(i) < localPV.Spec.Instances; i++ {
 		pvIndex := strconv.Itoa(i)
 		pvNameWithIndex := localPV.Name + "-pv-" + pvIndex
+		var folderCommand string
 		folderPath := HostPvDir + strings.ReplaceAll(pvNameWithIndex, "-", "_")
-		createFolderCommand := "mkdir -p " + folderPath + " && chmod 744 " + folderPath
+		if task == "create" {
+			folderCommand = "mkdir -p " + folderPath + " && chmod 744 " + folderPath
+		} else {
+			folderCommand = "rm -rf " + folderPath
+		}
 		volumeName := "pv-folder"
 		job := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "job-create-folder-" + pvNameWithIndex,
+				Name:      "job-" + task + "-folder-" + pvNameWithIndex,
 				Namespace: localPV.Namespace,
 			},
 			Spec: batchv1.JobSpec{
@@ -278,9 +309,9 @@ func (r *LocalPVReconciler) CreateJobToCreateFolder(localPV *uhanavmwarev1alpha1
 							},
 						}},
 						Containers: []corev1.Container{corev1.Container{
-							Name:    "create-local-pv",
+							Name:    task + "-local-pv",
 							Image:   "busybox",
-							Command: []string{"/bin/sh", "-c", createFolderCommand},
+							Command: []string{"/bin/sh", "-c", folderCommand},
 							VolumeMounts: []corev1.VolumeMount{corev1.VolumeMount{
 								Name:      volumeName,
 								ReadOnly:  false,
@@ -302,14 +333,14 @@ func (r *LocalPVReconciler) CreateJobToCreateFolder(localPV *uhanavmwarev1alpha1
 		}
 		jobs = append(jobs, *job)
 	}
-	err := r.CheckJobsStatus(jobs, log)
+	err := r.checkJobsStatus(jobs, log)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (r *LocalPVReconciler) CheckJobsStatus(jobs []batchv1.Job, log logr.Logger) error {
+func (r *LocalPVReconciler) checkJobsStatus(jobs []batchv1.Job, log logr.Logger) error {
 	timeout := time.After(120 * time.Second)
 	ticker := time.Tick(1 * time.Second)
 	for {
@@ -338,13 +369,13 @@ func (r *LocalPVReconciler) CheckJobsStatus(jobs []batchv1.Job, log logr.Logger)
 				}
 			}
 			for _, job := range completedJobs {
-				jobs = DeleteJobFromJoblist(job, jobs)
+				jobs = deleteJobFromJoblist(job, jobs)
 			}
 		}
 	}
 }
 
-func DeleteJobFromJoblist(jobToDelete batchv1.Job, jobs []batchv1.Job) []batchv1.Job {
+func deleteJobFromJoblist(jobToDelete batchv1.Job, jobs []batchv1.Job) []batchv1.Job {
 	newJobList := []batchv1.Job{}
 	for _, job := range jobs {
 		if job.Name != jobToDelete.Name {
@@ -362,6 +393,55 @@ func (r *LocalPVReconciler) updateFinalizer(f func(localPV controllerutil.Object
 		return err
 	}
 	return nil
+}
+
+func (r *LocalPVReconciler) randomizeNodes(nodes []corev1.Node) {
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(nodes), func(i, j int) {
+		nodes[i], nodes[j] = nodes[j], nodes[i]
+	})
+}
+
+func (r *LocalPVReconciler) listNodes(log logr.Logger, listOpts []client.ListOption) (*corev1.NodeList, error) {
+	nodeList := &corev1.NodeList{}
+	err := r.List(context.TODO(), nodeList, listOpts...)
+	if err != nil {
+		log.Error(err, "Failed to list nodes")
+		return nodeList, err
+	}
+	return nodeList, nil
+}
+
+func (r *LocalPVReconciler) patchNodeLabels(node *corev1.Node, labels map[string]string, log logr.Logger) error {
+	log.Info("Updating node labels")
+	newLabels := make([]LabelReplace, 1)
+	newLabels[0].Op = "replace"
+	newLabels[0].Path = "/metadata/labels"
+	newLabels[0].Value = labels
+	patchBytes, _ := json.Marshal(newLabels)
+	patch := client.RawPatch(types.JSONPatchType, patchBytes)
+	err := r.Patch(context.TODO(), node, patch)
+	if err != nil {
+		log.Error(err, "Failed to patch node", node.Name, "with labels", labels)
+		return err
+	}
+	return nil
+}
+
+func (r *LocalPVReconciler) getDiff(pvIndices []string, numInstances int32) []string {
+	tempMap := make(map[int]string)
+	for _, pvIndex := range pvIndices {
+		i, _ := strconv.Atoi(pvIndex)
+		tempMap[i] = pvIndex
+	}
+	var diff []string
+	for i := 0; i < int(numInstances); i++ {
+		_, ok := tempMap[i]
+		if !ok {
+			diff = append(diff, strconv.Itoa(i))
+		}
+	}
+	return diff
 }
 
 func (r *LocalPVReconciler) SetupWithManager(mgr ctrl.Manager) error {
