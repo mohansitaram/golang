@@ -106,7 +106,7 @@ func (r *LocalPVReconciler) createLocalPVhandler(localpv *uhanavmwarev1alpha1.Lo
 		return ctrl.Result{}, err
 	}
 	var pvIndices []string
-	var nodesWithoutLabel []*corev1.Node
+	var nodesWithoutLabel []corev1.Node
 
 	for _, node := range nodes {
 		// Check localpv.Name on every node and create if not present
@@ -394,15 +394,15 @@ func (r *LocalPVReconciler) updateFinalizer(f func(localPV controllerutil.Object
 	return nil
 }
 
-func (r *LocalPVReconciler) randomizeNodes(nodes *[]*corev1.Node) {
+func (r *LocalPVReconciler) randomizeNodes(nodes *[]corev1.Node) {
 	rand.Seed(time.Now().UnixNano())
 	rand.Shuffle(len(*nodes), func(i, j int) {
 		(*nodes)[i], (*nodes)[j] = (*nodes)[j], (*nodes)[i]
 	})
 }
 
-func (r *LocalPVReconciler) listNodes(log logr.Logger, listOpts []client.ListOption) ([]*corev1.Node, error) {
-	var nonCustomerNodes []*corev1.Node
+func (r *LocalPVReconciler) listNodes(log logr.Logger, listOpts []client.ListOption) ([]corev1.Node, error) {
+	var nonCustomerNodes []corev1.Node
 	nodeList := &corev1.NodeList{}
 	err := r.List(context.TODO(), nodeList, listOpts...)
 	if err != nil {
@@ -412,21 +412,13 @@ func (r *LocalPVReconciler) listNodes(log logr.Logger, listOpts []client.ListOpt
 	// Exclude customer/test nodes
 	for _, node := range nodeList.Items {
 		if _, ok := node.Labels["customer"]; !ok {
-			nonCustomerNodes = append(nonCustomerNodes, &node)
-			log.V(1).Info("Node", node.Name, "is not a customer node")
+			nonCustomerNodes = append(nonCustomerNodes, node)
 		}
 	}
-
-	var nodeNames []string
-	for _, node := range nonCustomerNodes {
-		nodeNames = append(nodeNames, node.Name)
-	}
-	log.V(1).Info("Unchecked nodes are", "nodes", nodeNames)
-
 	return nonCustomerNodes, nil
 }
 
-func (r *LocalPVReconciler) patchNodeLabels(node *corev1.Node, labels map[string]string, log logr.Logger) error {
+func (r *LocalPVReconciler) patchNodeLabels(node corev1.Node, labels map[string]string, log logr.Logger) error {
 	log.V(1).Info("Updating labels on", "node", node.Name)
 	newLabels := make([]LabelReplace, 1)
 	newLabels[0].Op = "replace"
@@ -434,7 +426,7 @@ func (r *LocalPVReconciler) patchNodeLabels(node *corev1.Node, labels map[string
 	newLabels[0].Value = labels
 	patchBytes, _ := json.Marshal(newLabels)
 	patch := client.RawPatch(types.JSONPatchType, patchBytes)
-	err := r.Patch(context.TODO(), node, patch)
+	err := r.Patch(context.TODO(), &node, patch)
 	if err != nil {
 		log.Error(err, "Failed to patch node", node.Name, "with labels", labels)
 		return err
