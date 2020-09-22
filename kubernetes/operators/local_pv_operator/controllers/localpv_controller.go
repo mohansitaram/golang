@@ -96,33 +96,32 @@ func (r *LocalPVReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 func (r *LocalPVReconciler) createLocalPVhandler(localpv *uhanavmwarev1alpha1.LocalPV, log logr.Logger) (ctrl.Result, error) {
 	// Check if the node labels are created, if not create them
 	listOpts := []client.ListOption{}
-	nodeList, err := r.listNodes(log, listOpts)
+	nodes, err := r.listNodes(log, listOpts)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if int32(len(nodeList.Items)) < localpv.Spec.Instances {
-		errMsg := fmt.Sprintf("Number of nodes %d is smaller than the required number of instances %d for %s", len(nodeList.Items), localpv.Spec.Instances, localpv.Name)
+	if int32(len(nodes)) < localpv.Spec.Instances {
+		errMsg := fmt.Sprintf("Number of nodes %d is smaller than the required number of instances %d for %s", len(nodes), localpv.Spec.Instances, localpv.Name)
 		err = errors.NewBadRequest(errMsg)
 		return ctrl.Result{}, err
 	}
 	var pvIndices []string
 	var nodesWithoutLabel []corev1.Node
-	for _, node := range nodeList.Items {
+
+	for _, node := range nodes {
 		// Check localpv.Name on every node and create if not present
-		for label, value := range node.Labels {
-			if label == localpv.Name {
-				// log.Info("Node ", node.Name, " already has label ", label)
-				pvIndices = append(pvIndices, strings.Split(value, "-")[2])
-			} else {
-				//log.Info(node.Name, " doesn't have the label")
-				nodesWithoutLabel = append(nodesWithoutLabel, node)
-			}
+		if value, ok := node.Labels[localpv.Name]; ok {
+			log.V(1).Info("Node", node.Name, "already has", "label", localpv.Name)
+			pvIndices = append(pvIndices, strings.Split(value, "-")[2])
+		} else {
+			log.V(1).Info("Node", node.Name, "doesn't have", "label", localpv.Name)
+			nodesWithoutLabel = append(nodesWithoutLabel, node)
 		}
 	}
 	if int32(len(pvIndices)) < localpv.Spec.Instances {
 		// Randomize the node list. Ideally we should take into account
 		// the nodes' current free disk
-		r.randomizeNodes(nodesWithoutLabel[:])
+		r.randomizeNodes(&nodesWithoutLabel)
 		// Assign labels to nodes
 		labelValuePrefix := localpv.Name + "-" + "pv" + "-"
 		remainingLabelIndices := r.getDiff(pvIndices, localpv.Spec.Instances)
@@ -131,7 +130,7 @@ func (r *LocalPVReconciler) createLocalPVhandler(localpv *uhanavmwarev1alpha1.Lo
 			// newLabels := nodeToLabel.Labels
 			label := labelValuePrefix + labelIndex
 			nodeToLabel.Labels[localpv.Name] = label
-			err = r.patchNodeLabels(&nodeToLabel, nodeToLabel.Labels, log)
+			err = r.patchNodeLabels(nodeToLabel, nodeToLabel.Labels, log)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -174,19 +173,19 @@ func (r *LocalPVReconciler) finalizeLocalPV(localPV *uhanavmwarev1alpha1.LocalPV
 	pvc := &corev1.PersistentVolumeClaim{}
 	for _, pv := range pvList.Items {
 		pvClaimRef := pv.Spec.ClaimRef
-		if pvClaimRef == nil {
-			log.Info("This PV doesn't have a PVC. Not deleting")
-			continue
-		}
-		err = r.Get(ctx, types.NamespacedName{Name: pvClaimRef.Name, Namespace: pvClaimRef.Namespace}, pvc)
-		if err != nil {
-			log.Error(err, "Failed to get PVC")
-		}
-		log.Info("Deleting PVC")
-		err = r.Delete(ctx, pvc)
-		if err != nil {
-			log.Error(err, "Failed to delete PVC.")
-			return err
+		// Sometimes the PV may not have a PVC which usually happens when there is no statefulset created to use the PV
+		if pvClaimRef != nil {
+			err = r.Get(ctx, types.NamespacedName{Name: pvClaimRef.Name, Namespace: pvClaimRef.Namespace}, pvc)
+			if err != nil {
+				log.Error(err, "Failed to get PVC")
+				return err
+			}
+			log.Info("Deleting PVC")
+			err = r.Delete(ctx, pvc)
+			if err != nil {
+				log.Error(err, "Failed to delete PVC.")
+				return err
+			}
 		}
 		log.Info("Deleting PV")
 		err = r.Delete(ctx, &pv)
@@ -211,14 +210,14 @@ func (r *LocalPVReconciler) finalizeLocalPV(localPV *uhanavmwarev1alpha1.LocalPV
 
 func (r *LocalPVReconciler) deleteNodeLabels(localpv *uhanavmwarev1alpha1.LocalPV, log logr.Logger) error {
 	listOpts := []client.ListOption{}
-	nodeList, err := r.listNodes(log, listOpts)
+	nodes, err := r.listNodes(log, listOpts)
 	if err != nil {
 		return err
 	}
-	for _, node := range nodeList.Items {
+	for _, node := range nodes {
 		if _, ok := node.Labels[localpv.Name]; ok {
 			delete(node.Labels, localpv.Name)
-			err = r.patchNodeLabels(&node, node.Labels, log)
+			err = r.patchNodeLabels(node, node.Labels, log)
 			if err != nil {
 				return err
 			}
@@ -395,32 +394,39 @@ func (r *LocalPVReconciler) updateFinalizer(f func(localPV controllerutil.Object
 	return nil
 }
 
-func (r *LocalPVReconciler) randomizeNodes(nodes []corev1.Node) {
+func (r *LocalPVReconciler) randomizeNodes(nodes *[]corev1.Node) {
 	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(nodes), func(i, j int) {
-		nodes[i], nodes[j] = nodes[j], nodes[i]
+	rand.Shuffle(len(*nodes), func(i, j int) {
+		(*nodes)[i], (*nodes)[j] = (*nodes)[j], (*nodes)[i]
 	})
 }
 
-func (r *LocalPVReconciler) listNodes(log logr.Logger, listOpts []client.ListOption) (*corev1.NodeList, error) {
+func (r *LocalPVReconciler) listNodes(log logr.Logger, listOpts []client.ListOption) ([]corev1.Node, error) {
+	var nonCustomerNodes []corev1.Node
 	nodeList := &corev1.NodeList{}
 	err := r.List(context.TODO(), nodeList, listOpts...)
 	if err != nil {
 		log.Error(err, "Failed to list nodes")
-		return nodeList, err
+		return nonCustomerNodes, err
 	}
-	return nodeList, nil
+	// Exclude customer/test nodes
+	for _, node := range nodeList.Items {
+		if _, ok := node.Labels["customer"]; !ok {
+			nonCustomerNodes = append(nonCustomerNodes, node)
+		}
+	}
+	return nonCustomerNodes, nil
 }
 
-func (r *LocalPVReconciler) patchNodeLabels(node *corev1.Node, labels map[string]string, log logr.Logger) error {
-	log.Info("Updating node labels")
+func (r *LocalPVReconciler) patchNodeLabels(node corev1.Node, labels map[string]string, log logr.Logger) error {
+	log.V(1).Info("Updating labels on", "node", node.Name)
 	newLabels := make([]LabelReplace, 1)
 	newLabels[0].Op = "replace"
 	newLabels[0].Path = "/metadata/labels"
 	newLabels[0].Value = labels
 	patchBytes, _ := json.Marshal(newLabels)
 	patch := client.RawPatch(types.JSONPatchType, patchBytes)
-	err := r.Patch(context.TODO(), node, patch)
+	err := r.Patch(context.TODO(), &node, patch)
 	if err != nil {
 		log.Error(err, "Failed to patch node", node.Name, "with labels", labels)
 		return err
