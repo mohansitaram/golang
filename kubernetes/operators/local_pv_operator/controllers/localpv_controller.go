@@ -115,16 +115,23 @@ func (r *LocalPVReconciler) createLocalPVhandler(localpv *uhanavmwarev1alpha1.Lo
 			pvIndices = append(pvIndices, strings.Split(value, "-")[2])
 		} else {
 			log.V(1).Info("Node", node.Name, "doesn't have", "label", localpv.Name)
+			if !r.checkNodeStatus(node) {
+				log.V(1).Info("Node", node.Name, "is not schedulable. Check CPU/Memory/Disk/Network")
+				continue
+			}
 			nodesWithoutLabel = append(nodesWithoutLabel, node)
 		}
 	}
+	remainingLabelIndices := r.getDiff(pvIndices, localpv.Spec.Instances)
+	if len(nodesWithoutLabel) < len(remainingLabelIndices) {
+		errMsg := fmt.Sprintf("There are only %d healthy nodes available for %d remaining LocalPV instances for %s", len(nodesWithoutLabel), len(remainingLabelIndices), localpv.Name)
+		err = errors.NewServiceUnavailable(errMsg)
+		return ctrl.Result{}, err
+	}
 	if int32(len(pvIndices)) < localpv.Spec.Instances {
-		// Randomize the node list. Ideally we should take into account
-		// the nodes' current free disk
 		r.randomizeNodes(&nodesWithoutLabel)
 		// Assign labels to nodes
 		labelValuePrefix := localpv.Name + "-" + "pv" + "-"
-		remainingLabelIndices := r.getDiff(pvIndices, localpv.Spec.Instances)
 		for i, labelIndex := range remainingLabelIndices {
 			nodeToLabel := nodesWithoutLabel[i]
 			// newLabels := nodeToLabel.Labels
@@ -399,6 +406,19 @@ func (r *LocalPVReconciler) randomizeNodes(nodes *[]corev1.Node) {
 	rand.Shuffle(len(*nodes), func(i, j int) {
 		(*nodes)[i], (*nodes)[j] = (*nodes)[j], (*nodes)[i]
 	})
+}
+
+func (r *LocalPVReconciler) checkNodeStatus(node corev1.Node) bool {
+	var nodeStatus bool = true
+	for _, condition := range node.Status.Conditions {
+		switch condition.Type {
+		case "Ready":
+			nodeStatus = nodeStatus && (condition.Status == "True")
+		case "MemoryPressure", "NodeDiskPressure", "NodePIDPressure", "NodeNetworkUnavailable":
+			nodeStatus = nodeStatus && (condition.Status == "False")
+		}
+	}
+	return nodeStatus
 }
 
 func (r *LocalPVReconciler) listNodes(log logr.Logger, listOpts []client.ListOption) ([]corev1.Node, error) {
